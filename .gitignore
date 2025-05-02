@@ -1,0 +1,35 @@
+# Compiled object files, libraries, and executable files
+*.o
+*.d
+*.a
+*.elf
+
+# Build output directory
+/build/
+
+# ESP-IDF specific files
+sdkconfig
+sdkconfig.old
+partition_table.csv
+partition_table.bin
+
+# Python virtual environment
+venv/
+.env/
+
+# Logs and debugging files
+*.log
+*.bak
+*.tmp
+
+# IDE specific files
+.vscode/
+.idea/
+*.code-workspace
+
+# Generated files
+*.bin
+*.hex
+*.map
+*.pyc
+__pycache__/
