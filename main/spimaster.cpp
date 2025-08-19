@@ -1,41 +1,43 @@
 #include "esp_http_server.h"
-#include <driver/spi_master.h>
-#include <driver/gpio.h>
-#include <esp_log.h>
-#include <esp_timer.h>
+#include "driver/spi_master.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "esp_timer.h"
 #include "mdns.h"
 
-#include "camera.hpp"
 #include "wifi.hpp"
-#include "button.hpp"
 #include "status.hpp"
-
-
-#define GPIO_MOSI 34
-#define GPIO_MISO 35
-#define GPIO_SCLK 18
-#define GPIO_CS1 26
-#define GPIO_CS2 33
-
-// struct spijpeg_pack{
-//     int32_t size;
-//     uint8_t bytes[4092];
-//   };
-// constexpr int jpegbuf_size = sizeof(spijpeg_pack);
 
 static const char* TAG      = "SPIMASTER";
 
-SemaphoreHandle_t jpeg_mutex;
+
+#define GPIO_MOSI 10
+#define GPIO_MISO 11
+#define GPIO_SCLK 8
+#define GPIO_CS1 9
+#define GPIO_CS3 13
+#define GPIO_CS2 12
+#define PIN_BTN GPIO_NUM_0
+#define PIN_LED GPIO_NUM_15
+#define PIN_POW GPIO_NUM_14
+
 uint8_t flags;
 
 // SPI handle
-spi_device_handle_t spi_handle[2];
+spi_device_handle_t spi_handle[3];
 
-constexpr int target_fps = 24;
+struct spijpeg_pack{
+  int32_t size;
+  uint8_t bytes[4000];
+};
+
+constexpr int jpegbuf_size = sizeof(spijpeg_pack);
+
+constexpr int target_fps = 60;
 constexpr int target_frame_time = 1000 / target_fps;
 
-spijpeg_pack* spi_buffer;
-spijpeg_pack* jpeg_buffer;
+spijpeg_pack* spi_buffer[3];
+// spijpeg_pack* jpeg_buffer;
 
 // FPS calculation
 uint8_t frame_count    = 0;
@@ -82,33 +84,27 @@ static esp_err_t spistream_handler(httpd_req_t* req, uint8_t spi_num) {
             break;
         }
         spi_transaction_t t;
-        //get semaphore
-        xSemaphoreTake(jpeg_mutex, portMAX_DELAY);
 
         memset(&t, 0, sizeof(t));
         t.length    = jpegbuf_size * 8; // 4 bytes * 8 bits
-        t.rx_buffer = spi_buffer;
+        t.rx_buffer = spi_buffer[spi_num];
 
         esp_err_t ret = spi_device_transmit(spi_handle[spi_num], &t);
 
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to receive JPEG size");
-            xSemaphoreGive(jpeg_mutex);
             continue;
         }
-        if(spi_buffer->size == 0){
-            xSemaphoreGive(jpeg_mutex);
+        if(spi_buffer[spi_num]->size == 0){
             continue;
         }
-        if(spi_buffer->size > jpegbuf_size) {
-            ESP_LOGE(TAG, "JPEG size too large: %d", (int)spi_buffer->size);
-            xSemaphoreGive(jpeg_mutex);
+        if(spi_buffer[spi_num]->size > jpegbuf_size) {
+            ESP_LOGE(TAG, "JPEG size too large: %d", (int)spi_buffer[spi_num]->size);
             continue;
         }
         //validate if data is correct jpeg format
-        if(spi_buffer->bytes[0] != 0xFF || spi_buffer->bytes[1] != 0xD8){
+        if(spi_buffer[spi_num]->bytes[0] != 0xFF || spi_buffer[spi_num]->bytes[1] != 0xD8){
             ESP_LOGE(TAG, "JPEG data is not valid");
-            xSemaphoreGive(jpeg_mutex);
             continue;
         }
 
@@ -119,14 +115,14 @@ static esp_err_t spistream_handler(httpd_req_t* req, uint8_t spi_num) {
             res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
         }
         if(res == ESP_OK){
-            size_t hlen = snprintf(part_buf, 64, _STREAM_PART, spi_buffer->size);
+            size_t hlen = snprintf(part_buf, 64, _STREAM_PART, spi_buffer[spi_num]->size);
 
             res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
         }
         if(res == ESP_OK){
-            res = httpd_resp_send_chunk(req, (char *)spi_buffer->bytes, spi_buffer->size);
+            res = httpd_resp_send_chunk(req, (char *)spi_buffer[spi_num]->bytes, spi_buffer[spi_num]->size);
         }
-        xSemaphoreGive(jpeg_mutex);
+        // xSemaphoreGive(jpeg_mutex);
         if (res != ESP_OK) {
             break;
         }
@@ -200,61 +196,7 @@ static esp_err_t rightstream_handler(httpd_req_t* req) {
 
 static void facestream_task(void* arg){
     httpd_req_t* req = (httpd_req_t*)arg;
-    ESP_LOGI(TAG, "Stream handler called");
-    esp_err_t res = ESP_OK;
-
-    while (1) {
-        //check if httpd connection alive
-        res = httpd_resp_sendstr_chunk(req, " ");
-        if (res != ESP_OK) {
-            ESP_LOGI(TAG, "Client disconnected, stopping stream CODE : %04x",res);
-            break;
-        }
-        char   part_buf[64];
-        // camera_fb_t * fb = NULL;
-        // fb = esp_camera_fb_get();
-        // if (!fb) {
-        //     ESP_LOGE(TAG, "Camera capture failed");
-        //     res = ESP_FAIL;
-        //     continue;
-        // }
-        // if(fb->format != PIXFORMAT_JPEG){
-        //     xSemaphoreTake(jpeg_mutex, portMAX_DELAY);
-        //     bool jpeg_converted = newFrame2jpg(fb, jpeg_buffer->bytes, (int*)&jpeg_buffer->size);
-        //     if(!jpeg_converted){
-        //         ESP_LOGE(TAG, "JPEG compression failed");
-        //         xSemaphoreGive(jpeg_mutex);
-        //         esp_camera_fb_return(fb);
-        //         continue;
-        //     }
-        // }
-        // esp_camera_fb_return(fb);
-        // xSemaphoreGive(jpeg_mutex);
-        res = getCameraJpeg(jpeg_buffer->bytes, (int*)&jpeg_buffer->size);
-        if(jpeg_buffer->size == 0){
-            ESP_LOGE(TAG, "JPEG size is 0");
-            continue;
-        }
-        if(jpeg_buffer->size > jpegbuf_size) {
-            ESP_LOGE(TAG, "JPEG size too large: %d", (int)jpeg_buffer->size);
-            continue;
-        }
-        if(res == ESP_OK){
-            res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-        }
-        if(res == ESP_OK){
-            size_t hlen = snprintf(part_buf, 64, _STREAM_PART, jpeg_buffer->size);
-
-            res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
-        }
-        if(res == ESP_OK){
-            res = httpd_resp_send_chunk(req, (char *)jpeg_buffer->bytes, jpeg_buffer->size);
-        }
-        if (res != ESP_OK) {
-            break;
-        }
-        update_fps();
-    }
+    spistream_handler(req, 2);
     httpd_resp_send_chunk(req, NULL, 0); // End the response
     httpd_req_async_handler_complete(req); // Complete the async handler
     flags &= ~(1<<2);
@@ -283,30 +225,25 @@ static esp_err_t face_stream_handler(httpd_req_t* req) {
     return ESP_OK;
 }
 
-#define PIN_POW GPIO_NUM_1
 extern "C" void app_main(void) {
     gpio_config_t io_conf = {};
-    io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_OUTPUT;
     io_conf.pin_bit_mask = (1ULL << PIN_POW | (1ULL << PIN_LED));
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     gpio_config(&io_conf);
-    gpio_set_level(PIN_POW, 1);
+
+    io_conf.pin_bit_mask = (1ULL << PIN_BTN);
+    io_conf.mode = GPIO_MODE_INPUT;
+    gpio_config(&io_conf);
+
     gpio_set_level(PIN_LED, 1);
-
-    io_conf.pin_bit_mask = (1ULL << PIN_BTN),
-    io_conf.mode = GPIO_MODE_INPUT,
-    io_conf.pull_up_en = GPIO_PULLUP_ENABLE,
-    io_conf.intr_type = GPIO_INTR_ANYEDGE,
-    gpio_config(&io_conf);
-
-    // GPIO 인터럽트 핸들러 설정
-    gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1);
-    gpio_isr_handler_add((gpio_num_t)PIN_BTN, gpio_isr_handler, (void*)NULL);
-    //make button_task
-    if(xTaskCreatePinnedToCore(button_task, "button_task", 1024, NULL, 5, NULL, 1) != pdPASS) {
+    gpio_set_level(PIN_POW, 0); // Power off the camera
+    
+    //wait until button(gpio 0) is pressed
+    while(gpio_get_level(PIN_BTN) == 1){
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
+    
+    gpio_set_level(PIN_LED, 0);
 
 
     // configuration for the SPI bus
@@ -319,7 +256,7 @@ extern "C" void app_main(void) {
     buscfg.max_transfer_sz  = jpegbuf_size;
 
     // configuration for the SPI device
-    spi_device_interface_config_t devcfg[2] = {};
+    spi_device_interface_config_t devcfg[3] = {};
     devcfg[0].command_bits                  = 0;
     devcfg[0].address_bits                  = 0;
     devcfg[0].dummy_bits                    = 0;
@@ -332,6 +269,9 @@ extern "C" void app_main(void) {
 
     devcfg[1] = devcfg[0];
     devcfg[1].spics_io_num                  = GPIO_CS2;
+
+    devcfg[2] = devcfg[0];
+    devcfg[2].spics_io_num                  = GPIO_CS3;
 
     // initialize SPI bus and add device
     esp_err_t ret = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
@@ -350,35 +290,26 @@ extern "C" void app_main(void) {
         ESP_LOGE(TAG, "Failed to add SPI device2");
         return;
     }
+    ret = spi_bus_add_device(SPI2_HOST, &devcfg[2], &spi_handle[2]);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add SPI device3");
+        return;
+    }
 
     ESP_LOGI(TAG, "SPI Master initialized successfully");
 
 
     // connect to WiFi
     connect_wifi();
-    //Wait for wifi connection
-
-    //initialize camera
-    ret = initCam();
-    if (ret != ESP_OK){
-        ESP_LOGE(TAG, "Failed to initialize Camera:%04x",ret);
-        // return;
+    for(int i = 0; i < 3; i++) {
+        spi_buffer[i] = (spijpeg_pack*)heap_caps_malloc(jpegbuf_size, MALLOC_CAP_DMA);
+        if (!spi_buffer[i]) {
+            ESP_LOGE(TAG, "Failed to allocate SPI buffer");
+            return;
+        }
     }
 
-    // IMPORTANT!!!!!!: allocate DMA-capable memory for JPEG buffer
-    jpeg_buffer = (spijpeg_pack*)heap_caps_malloc(jpegbuf_size,MALLOC_CAP_DMA);
-    spi_buffer = (spijpeg_pack*)heap_caps_malloc(jpegbuf_size,MALLOC_CAP_DMA);
-    if (!jpeg_buffer || !spi_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate JPEG buffer");
-        return;
-    }
-    jpeg_mutex = xSemaphoreCreateMutex();
-    if (!jpeg_mutex) {
-        ESP_LOGE(TAG, "Failed to create JPEG mutex");
-        return;
-    }
-
-    ESP_LOGI(TAG,"\nWiFi connected");
+    ESP_LOGI(TAG,"WiFi connected");
 
     // Initialize mDNS as nareface.local
     esp_err_t err = mdns_init();
@@ -391,7 +322,6 @@ extern "C" void app_main(void) {
         ESP_LOGE(TAG, "mDNS Hostname failed: %s", esp_err_to_name(err));
         return;
     }
-    printf("test");
 
     // start HTTP server
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -408,4 +338,5 @@ extern "C" void app_main(void) {
         httpd_register_uri_handler(stream_httpd, &stream_uri[1]);
         httpd_register_uri_handler(stream_httpd, &stream_uri[2]);
     }
+    gpio_set_level(PIN_POW, 1);
 }
