@@ -5,84 +5,54 @@
 #include <esp_timer.h>
 #include <nvs_flash.h>
 #include "esp_netif.h"
-#include <esp_smartconfig.h>
 #include "esp_mac.h"
+#include <string.h>
+#include "globals.h"
+#include "status.hpp"
 
 #ifndef NAREDEF_WIFI
 #define NAREDEF_WIFI
 
-#define CONFIG_DEFAULT_SSID "ESP32"
-#define CONFIG_DEFAULT_PASSWORD "12345678"
+// SoftAP defaults for provisioning UI
+#define PROV_AP_SSID "nareface-setup"
+#define PROV_AP_PASSWORD ""
+#define PROV_AP_CHANNEL 6
 
 static EventGroupHandle_t s_wifi_event_group;
+
 
 /* The event group allows multiple bits for each event,
    but we only care about one event - are we connected
    to the AP with an IP? */
-   static const int CONNECTED_BIT = BIT0;
-   static const int ESPTOUCH_DONE_BIT = BIT1;
+    static const int CONNECTED_BIT = BIT0;
+    static const int ESPTOUCH_DONE_BIT = BIT1;
+    static const int SCAN_DONE_BIT = BIT2;
 
-   wifi_config_t wifi_config;
+    wifi_config_t wifi_config;
+    static bool s_ap_running = false;
 
-static void smartconfig_example_task(void * parm);
-static void event_handler(void* arg, esp_event_base_t event_base,
+    // Simple ring buffer for last scan results
+    static wifi_ap_record_t s_scan_records[32];
+    static uint16_t s_scan_count = 0;
+    uint8_t softap_manual_start = 0;
+static void start_softap();
+static void stop_softap();
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
-        ESP_LOGI("WIFI", "Connecting to AP...");
-        //delay 5 seconds
-        vTaskDelay(5000 / portTICK_PERIOD_MS);
-        //if not connected, start smartconfig
-        if(!(xEventGroupGetBits(s_wifi_event_group) & CONNECTED_BIT)){
-            ESP_LOGI("WIFI", "Starting SmartConfig...");
-            xTaskCreate(smartconfig_example_task, "smartconfig_example_task", 4096, NULL, 3, NULL);
-        }
+        start_softap();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-    esp_wifi_connect();
-    xEventGroupClearBits(s_wifi_event_group, CONNECTED_BIT);
+        esp_wifi_connect();
+        xEventGroupClearBits(s_wifi_event_group, CONNECTED_BIT);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+    ledStatus = LEDS_WIFI_CONNECTED;
+    if(softap_manual_start == 0) {
+        stop_softap();
+    }
     xEventGroupSetBits(s_wifi_event_group, CONNECTED_BIT);
-    } else if (event_base == SC_EVENT && event_id == SC_EVENT_SCAN_DONE) {
-    ESP_LOGI("WIFI", "Scan done");
-    } else if (event_base == SC_EVENT && event_id == SC_EVENT_FOUND_CHANNEL) {
-    ESP_LOGI("WIFI", "Found channel");
-    } else if (event_base == SC_EVENT && event_id == SC_EVENT_GOT_SSID_PSWD) {
-    ESP_LOGI("WIFI", "Got SSID and password");
-
-    smartconfig_event_got_ssid_pswd_t *evt = (smartconfig_event_got_ssid_pswd_t *)event_data;
-    uint8_t ssid[33] = { 0 };
-    uint8_t rvd_data[33] = { 0 };
-
-    bzero(&wifi_config, sizeof(wifi_config_t));
-    memcpy(wifi_config.sta.ssid, evt->ssid, sizeof(wifi_config.sta.ssid));
-    memcpy(wifi_config.sta.password, evt->password, sizeof(wifi_config.sta.password));
-
-    #ifdef CONFIG_SET_MAC_ADDRESS_OF_TARGET_AP
-            wifi_config.sta.bssid_set = evt->bssid_set;
-            if (wifi_config.sta.bssid_set == true) {
-                ESP_LOGI("WIFI", "Set MAC address of target AP: "MACSTR" ", MAC2STR(evt->bssid));
-                memcpy(wifi_config.sta.bssid, evt->bssid, sizeof(wifi_config.sta.bssid));
-            }
-    #endif
-
-            memcpy(ssid, evt->ssid, sizeof(evt->ssid));
-            ESP_LOGI("WIFI", "SSID:%s", ssid);
-            if (evt->type == SC_TYPE_ESPTOUCH_V2) {
-                ESP_ERROR_CHECK( esp_smartconfig_get_rvd_data(rvd_data, sizeof(rvd_data)) );
-                ESP_LOGI("WIFI", "RVD_DATA:");
-                for (int i=0; i<33; i++) {
-                    printf("%02x ", rvd_data[i]);
-                }
-                printf("\n");
-            }
-
-            ESP_ERROR_CHECK( esp_wifi_disconnect() );
-            ESP_ERROR_CHECK( esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
-            esp_wifi_connect();
-        } else if (event_base == SC_EVENT && event_id == SC_EVENT_SEND_ACK_DONE) {
-            xEventGroupSetBits(s_wifi_event_group, ESPTOUCH_DONE_BIT);
-        }
+    }
 }
 void connect_wifi() {
     //load ssid and password from NVS
@@ -97,12 +67,11 @@ void connect_wifi() {
     size_t ssid_len = 0;
     size_t password_len = 0;
     if(nvs_get_str(my_handle, "ssid", NULL, &ssid_len)==ESP_ERR_NVS_NOT_FOUND){
-        ESP_LOGI("WIFI", "SSID not found in NVS, using default SSID");
-        memcpy(wifi_config.sta.ssid, CONFIG_DEFAULT_SSID, sizeof(wifi_config.sta.ssid));
-        memcpy(wifi_config.sta.password, CONFIG_DEFAULT_PASSWORD, sizeof(wifi_config.sta.password));
+        ESP_LOGI("WIFI", "SSID not found in NVS, starting AP mode");
+        start_softap();
     }else{
         nvs_get_str(my_handle, "password", NULL, &password_len);
-        ESP_LOGI("WIFI","Password Length : %u", password_len);
+        ESP_LOGI("WIFI", "Password Length : %u", password_len);
         char *ssid = (char *)malloc(32);
         char *password = (char *)malloc(64);
         ESP_ERROR_CHECK(nvs_get_str(my_handle, "ssid", ssid, &ssid_len));
@@ -128,52 +97,125 @@ void connect_wifi() {
     ESP_ERROR_CHECK( esp_wifi_init(&cfg) );
     ESP_LOGI("WIFI", "WiFi initialized");
 
-    ESP_ERROR_CHECK( esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL) );
-    ESP_ERROR_CHECK( esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL) );
-    ESP_ERROR_CHECK( esp_event_handler_register(SC_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL) );
+    ESP_ERROR_CHECK( esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL) );
+    ESP_ERROR_CHECK( esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL) );
 
     ESP_LOGI("WIFI", "event handlers registered");
     ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_STA) );
     ESP_ERROR_CHECK( esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
     ESP_ERROR_CHECK( esp_wifi_start() );
     ESP_LOGI("WIFI", "WiFi started");
-    //wait for wifi to connect
-    xEventGroupWaitBits(s_wifi_event_group, CONNECTED_BIT, false, true, portMAX_DELAY);
 }
 
-static void smartconfig_example_task(void * parm)
-{
-    EventBits_t uxBits;
-    ESP_ERROR_CHECK( esp_smartconfig_set_type(SC_TYPE_ESPTOUCH) );
-    smartconfig_start_config_t cfg = SMARTCONFIG_START_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK( esp_smartconfig_start(&cfg) );
-    while (1) {
-        uxBits = xEventGroupWaitBits(s_wifi_event_group, CONNECTED_BIT | ESPTOUCH_DONE_BIT, true, false, portMAX_DELAY);
-        if(uxBits & CONNECTED_BIT) {
-            ESP_LOGI("WIFI", "WiFi Connected to ap");
-            //save SSID and password to NVS
-            esp_err_t err = nvs_flash_init_partition("nvs");
-            if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-                ESP_ERROR_CHECK(nvs_flash_erase_partition("nvs"));
-                err = nvs_flash_init_partition("nvs");
-            }
-            ESP_ERROR_CHECK(err);
-            nvs_handle_t my_handle;
-            ESP_ERROR_CHECK(nvs_open("storage", NVS_READWRITE, &my_handle));
-            ESP_ERROR_CHECK(nvs_set_str(my_handle, "ssid", (const char *)wifi_config.sta.ssid));
-            ESP_ERROR_CHECK(nvs_set_str(my_handle, "password", (const char *)wifi_config.sta.password));
-            ESP_LOGI("WIFI", "SSID:%s", wifi_config.sta.ssid);
-            ESP_LOGI("WIFI", "PASSWORD:%s", wifi_config.sta.password);
-            ESP_ERROR_CHECK(nvs_commit(my_handle));
-            nvs_close(my_handle);
-            ESP_LOGI("WIFI", "SSID and password saved to NVS");
-            ESP_ERROR_CHECK( esp_smartconfig_stop() );
-        }
-        if(uxBits & ESPTOUCH_DONE_BIT) {
-            ESP_LOGI("WIFI", "smartconfig over");
-            esp_smartconfig_stop();
-            vTaskDelete(NULL);
+// Start a minimal SoftAP for provisioning UI concurrent with STA
+static void start_softap() {
+    if (s_ap_running) return;
+    // Switch to APSTA mode
+    ledStatus = LEDS_WIFI_PROVISIONING;
+    wifi_mode_t mode;
+    esp_wifi_get_mode(&mode);
+    if (mode != WIFI_MODE_APSTA) {
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    }
+
+    // Create AP netif if needed
+    static esp_netif_t* ap_netif = nullptr;
+    if (!ap_netif) {
+        ap_netif = esp_netif_create_default_wifi_ap();
+    }
+
+    wifi_config_t ap_cfg = {};
+    strncpy((char*)ap_cfg.ap.ssid, PROV_AP_SSID, sizeof(ap_cfg.ap.ssid));
+    ap_cfg.ap.ssid_len = strlen(PROV_AP_SSID);
+    ap_cfg.ap.channel = PROV_AP_CHANNEL;
+    ap_cfg.ap.max_connection = 4;
+    ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
+    if (strlen(PROV_AP_PASSWORD) > 0) {
+        ap_cfg.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+        strncpy((char*)ap_cfg.ap.password, PROV_AP_PASSWORD, sizeof(ap_cfg.ap.password));
+    }
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    s_ap_running = true;
+}
+
+static void stop_softap() {
+    if (!s_ap_running) return;
+    s_ap_running = false;
+    if(ledStatus == LEDS_WIFI_PROVISIONING) {
+        if(xEventGroupGetBits(s_wifi_event_group) & CONNECTED_BIT) {
+            ledStatus = LEDS_WIFI_CONNECTED;
+        } else {
+            ledStatus = LEDS_OFF;
         }
     }
 }
+
+// Trigger a passive scan and cache results
+static esp_err_t wifi_scan_now(uint16_t max_records = 32) {
+    //if AP is running, disconnect STA mode
+    if (s_ap_running) {
+        ESP_ERROR_CHECK(esp_wifi_disconnect());
+    }
+    // Try to scan while connected: disable PS to reduce dropouts
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    wifi_scan_config_t scan_cfg = {};
+    scan_cfg.show_hidden = true;
+    scan_cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    // Short active dwell per channel to minimize impact while connected
+    scan_cfg.scan_time.active.min = 30; // ms
+    scan_cfg.scan_time.active.max = 60; // ms
+    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
+    if (err != ESP_OK) {
+        ESP_LOGW("WIFI", "scan_start failed: %s", esp_err_to_name(err));
+        // Fallback: try passive quick scan
+        memset(&scan_cfg, 0, sizeof(scan_cfg));
+        scan_cfg.show_hidden = true;
+        scan_cfg.scan_type = WIFI_SCAN_TYPE_PASSIVE;
+        scan_cfg.scan_time.passive = 60; // ms per channel
+        err = esp_wifi_scan_start(&scan_cfg, true);
+    }
+    if (err != ESP_OK) {
+        // Give up
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        return err;
+    }
+    s_scan_count = max_records;
+    err = esp_wifi_scan_get_ap_records(&s_scan_count, s_scan_records);
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    return err;
+}
+
+// Accessors for HTTP layer
+static inline uint16_t wifi_scan_count() { return s_scan_count; }
+static inline const wifi_ap_record_t* wifi_scan_records() { return s_scan_records; }
+static inline esp_err_t wifi_set_credentials_and_connect(const char* ssid, const char* pass) {
+    bzero(&wifi_config, sizeof(wifi_config));
+    strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+    strncpy((char*)wifi_config.sta.password, pass ? pass : "", sizeof(wifi_config.sta.password));
+    ESP_ERROR_CHECK( esp_wifi_disconnect() );
+    ESP_ERROR_CHECK( esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
+    return esp_wifi_connect();
+}
+
+static inline esp_err_t wifi_save_credentials_to_nvs(const char* ssid, const char* pass) {
+    esp_err_t err = nvs_flash_init_partition("nvs");
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase_partition("nvs"));
+        err = nvs_flash_init_partition("nvs");
+    }
+    if (err != ESP_OK) return err;
+    nvs_handle_t my_handle = 0;
+    err = nvs_open("storage", NVS_READWRITE, &my_handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_str(my_handle, "ssid", ssid);
+    if (err == ESP_OK) {
+        err = nvs_set_str(my_handle, "password", pass ? pass : "");
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(my_handle);
+    }
+    nvs_close(my_handle);
+    return err;
+}
+
 #endif // NAREDEF_WIFI
