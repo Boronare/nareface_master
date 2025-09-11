@@ -14,6 +14,8 @@ void button_task(void* arg) {
     constexpr int16_t CLICK_WIN_MS = 700;   // time window for multi-click
     constexpr int16_t DEBOUNCE_MS = 40;     // debounce window
 
+    idle_counter = 30; // reset idle timer
+    
     // Debounce state
     bool raw = (gpio_get_level(PIN_BTN) == 0);
     bool debounced = raw;
@@ -82,15 +84,15 @@ void button_task(void* arg) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     ESP_LOGI("BUTTON", "Button handling done");
-    button_handling = 0;
+    globalStatus &= ~GLOBALSTAT_BUTTON_HANDLING;
     vTaskDelete(NULL);
 }
 
 //button ISR handler
 void IRAM_ATTR button_isr_handler(void* arg) {
-    if(button_handling) return; // already handling button
-    button_handling = 1;
-    xTaskCreate(button_task, "btn_task", 2048, NULL, 5, NULL);
+    if(globalStatus & GLOBALSTAT_BUTTON_HANDLING) return; // already handling button
+    globalStatus |= GLOBALSTAT_BUTTON_HANDLING;
+    xTaskCreate(button_task, "btn_task", 1024, NULL, 5, NULL);
 }
 
 #endif // NAREDEF_BUTTON

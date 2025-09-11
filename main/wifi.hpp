@@ -46,8 +46,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         esp_wifi_connect();
         xEventGroupClearBits(s_wifi_event_group, CONNECTED_BIT);
+        globalStatus &= ~GLOBALSTAT_CONNECTED; // not connected
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-    ledStatus = LEDS_WIFI_CONNECTED;
+    globalStatus |= GLOBALSTAT_CONNECTED; // connected
     if(softap_manual_start == 0) {
         stop_softap();
     }
@@ -111,7 +112,7 @@ void connect_wifi() {
 static void start_softap() {
     if (s_ap_running) return;
     // Switch to APSTA mode
-    ledStatus = LEDS_WIFI_PROVISIONING;
+    globalStatus |= GLOBALSTAT_PROVISIONING;
     wifi_mode_t mode;
     esp_wifi_get_mode(&mode);
     if (mode != WIFI_MODE_APSTA) {
@@ -141,13 +142,13 @@ static void start_softap() {
 static void stop_softap() {
     if (!s_ap_running) return;
     s_ap_running = false;
-    if(ledStatus == LEDS_WIFI_PROVISIONING) {
-        if(xEventGroupGetBits(s_wifi_event_group) & CONNECTED_BIT) {
-            ledStatus = LEDS_WIFI_CONNECTED;
-        } else {
-            ledStatus = LEDS_OFF;
-        }
+    // Switch back to STA only mode
+    wifi_mode_t mode;
+    esp_wifi_get_mode(&mode);
+    if (mode != WIFI_MODE_STA) {
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     }
+    globalStatus &= ~GLOBALSTAT_PROVISIONING;
 }
 
 // Trigger a passive scan and cache results

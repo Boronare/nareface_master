@@ -11,19 +11,20 @@ struct ledPattern{
     uint8_t rest100mss;
 };
 ledPattern ledPatterns[] = {
-    {0, 1, 1, 1},  // LEDS_OFF
-    {5, 5, 3, 30},  // LEDS_WIFI_PROVISIONING
-    {1, 1, 1, 30},  // LEDS_WIFI_CONNECTED
-    {0, 0, 1, 0},  // should not occur
-    {10, 0, 1, 0},  // LEDS_BOOTING
+    {1, 0, 1, 0},  // BOOTING
+    {1, 1, 2, 30},  // WIFI_CONNECTED
+    {5, 5, 3, 30},  // WIFI_PROVISIONING
+    {1, 1, 1, 50},  // STREAMING
+    {0, 0, 0, 1},  // BUTTON_HANDLING
 };
 static void ledStatusTask(void* arg) {
     while (true) {
-        if(button_handling) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-        ledStatusType status = ledStatus;
+        uint8_t status = 0;
+        uint8_t oldStatus = globalStatus;
+        if(globalStatus & GLOBALSTAT_BUTTON_HANDLING) status = 4;
+        else if(globalStatus & GLOBALSTAT_STREAMING) status = 3;
+        else if(globalStatus & GLOBALSTAT_PROVISIONING) status = 2;
+        else if(globalStatus & GLOBALSTAT_CONNECTED) status = 1;
         ledPattern pattern = ledPatterns[status];
         for (uint8_t i = 0; i < pattern.repeat; i++) {
             // turn on LED
@@ -32,12 +33,12 @@ static void ledStatusTask(void* arg) {
             // Turn off LEDs
             gpio_set_level(PIN_LED, 0);
             vTaskDelay(pdMS_TO_TICKS(100*pattern.turn_off100mss));
-            if (status != ledStatus) {
+            if (oldStatus != globalStatus) {
                 break;
             }
         }
         for (uint8_t i = 0; i < pattern.rest100mss; i++) {
-            if (status != ledStatus) {
+            if (oldStatus != globalStatus) {
                 break;
             }
             vTaskDelay(pdMS_TO_TICKS(100));

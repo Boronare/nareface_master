@@ -35,19 +35,34 @@ static const char HTML_INDEX[] =
 
 
 uint8_t flags;
+// Forward declaration for deep sleep helper used by timer task
+static void enter_deep_sleep_wait_button();
+
+
+
+void idle_timer_task(void* arg) {
+    while(1){
+        if(idle_counter > 0) idle_counter--;
+        else enter_deep_sleep_wait_button();
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+}
+static inline void idle_timer_cancel() { idle_counter = 65535; }
+
+static inline void idle_timer_arm_5min() { idle_counter = 30; }
 
 // SPI handle
 spi_device_handle_t spi_handle[3];
 
 struct spijpeg_pack{
   uint16_t size;
-  uint8_t bytes[8000];
+  uint8_t bytes[4000];
 };
 
 constexpr int jpegbuf_size = sizeof(spijpeg_pack);
 
-constexpr int target_fps = 18;
-constexpr int target_frame_time = 60;
+constexpr int target_fps = 33;
+constexpr int target_frame_time = 30;
 
 spijpeg_pack* spi_buffer;
 SemaphoreHandle_t jpeg_semaphore;
@@ -59,16 +74,16 @@ float    current_fps    = 0.0;
 
 
 void update_fps() {
-    frame_count++;
-    uint32_t current_time = esp_timer_get_time() / 1000; // Convert microseconds to milliseconds
-    uint32_t elapsed_time = current_time - last_fps_check;
+    // frame_count++;
+    // uint32_t current_time = esp_timer_get_time() / 1000; // Convert microseconds to milliseconds
+    // uint32_t elapsed_time = current_time - last_fps_check;
 
-    if (elapsed_time >= 1000) { // Calculate FPS every second
-        current_fps = frame_count * 1000.0f / elapsed_time;
-        ESP_LOGI(TAG, "Current FPS: %.1f / Memory Available : %d bytes", current_fps, heap_caps_get_free_size(MALLOC_CAP_8BIT));
-        frame_count = 0;
-        last_fps_check = current_time;
-    }
+    // if (elapsed_time >= 1000) { // Calculate FPS every second
+    //     current_fps = frame_count * 1000.0f / elapsed_time;
+    //     ESP_LOGI(TAG, "Current FPS: %.1f / Memory Available : %d bytes", current_fps, heap_caps_get_free_size(MALLOC_CAP_8BIT));
+    //     frame_count = 0;
+    //     last_fps_check = current_time;
+    // }
 }
 uint16_t lasttime[3] = {0};
 void waitFrameTime(uint8_t devnum){
@@ -88,6 +103,8 @@ static const char* _STREAM_PART         = "Content-Type: image/jpeg\r\nContent-L
 
 // --- Provisioning HTTP handlers ---
 static esp_err_t index_get_handler(httpd_req_t* req){
+    // Arm idle sleep timer on non-stream request
+    idle_timer_arm_5min();
     httpd_resp_set_type(req, "text/html");
     // Stream in chunks to reduce memory pressure
     // Prepend embedded scan results as window.__APS
@@ -141,6 +158,8 @@ static size_t url_decode_to(char* dst, size_t dst_cap, const char* src, size_t s
 }
 
 static esp_err_t provision_post_handler(httpd_req_t* req){
+    // Arm idle sleep timer on non-stream request
+    idle_timer_arm_5min();
     // Read x-www-form-urlencoded body (read full content_len or up to buffer size)
     char content[256]={0};
     size_t total = 0, want = req->content_len;
@@ -260,6 +279,8 @@ static float read_battery_voltage() {
 }
 
 static esp_err_t status_get_handler(httpd_req_t* req){
+    // Arm idle sleep timer on non-stream request
+    idle_timer_arm_5min();
     httpd_resp_set_type(req, "application/json");
     float vbat = read_battery_voltage();
     // Rough SoC estimation from voltage (Li-ion approximation)
@@ -275,8 +296,12 @@ static esp_err_t status_get_handler(httpd_req_t* req){
 
 // --- Button handling ---
 static void enter_deep_sleep_wait_button() {
-    ESP_LOGI(TAG, "Entering deep sleep. Hold BTN for 3s to wake.");
+    // ESP_LOGI(TAG, "Entering deep sleep. Hold BTN for 3s to wake.");
     // Configure wake on BTN low level
+    for(int8_t i=0;i<100;i++){
+        gpio_set_level(PIN_LED, 1);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
     ESP_ERROR_CHECK(esp_sleep_enable_ext0_wakeup(PIN_BTN, 0));
     gpio_set_level(PIN_LED, 0);
     gpio_set_level(PIN_POW, 0);
@@ -365,17 +390,25 @@ static void stream_task(void* arg) {
     StreamTaskArg* a = (StreamTaskArg*)arg;
     httpd_req_t* req = a->req;
     uint8_t idx = a->index;
-    gpio_set_level(PIN_LED, 1);
+    gpio_set_level(PIN_POW, 1);
+    globalStatus |= GLOBALSTAT_STREAMING; // streaming
     spistream_handler(req, idx);
     httpd_resp_send_chunk(req, NULL, 0);
     httpd_req_async_handler_complete(req);
     flags &= ~(1<<idx);
-    if(!flags) gpio_set_level(PIN_LED, 0);
+    if(!flags) {
+        gpio_set_level(PIN_POW, 0);
+        // Stream ended and no other streams active: arm 5-minute idle sleep
+        idle_timer_arm_5min();
+        globalStatus &= ~GLOBALSTAT_STREAMING; // not streaming
+    }
     free(a);
     vTaskDelete(NULL);
 }
 
 static esp_err_t stream_handler_common(httpd_req_t* req) {
+    // Cancel idle sleep while streaming
+    idle_timer_cancel();
     uint8_t idx = (uint8_t)(uintptr_t)req->user_ctx; // 0:left,1:right,2:face
     if (flags & (1<<idx)) {
         ESP_LOGI(TAG, "Stream %u already started", idx);
@@ -436,8 +469,8 @@ extern "C" void app_main(void) {
     }
     ESP_LOGI(TAG, "Button configured: long-press to sleep, triple-click to SoftAP");
     // Start button handler
-    xTaskCreate(button_task, "btn_task", 2048, NULL, 5, NULL);
-    xTaskCreate(ledStatusTask, "led_status_task", 2048, NULL, 5, NULL);
+    xTaskCreate(ledStatusTask, "led_status_task", 1024, NULL, 5, NULL);
+    xTaskCreate(idle_timer_task, "idle_timer_task", 1024, NULL, 5, NULL);
 
     // invoke interrupt when button is pressed
     gpio_set_intr_type(PIN_BTN, GPIO_INTR_NEGEDGE);
@@ -546,6 +579,7 @@ extern "C" void app_main(void) {
         httpd_register_uri_handler(stream_httpd, &stream_uri[3]);
         httpd_register_uri_handler(stream_httpd, &stream_uri[4]);
         httpd_register_uri_handler(stream_httpd, &stream_uri[5]);
+    // Arm initial idle sleep timer once server is up
+    idle_timer_arm_5min();
     }
-    gpio_set_level(PIN_POW, 1);
 }
