@@ -12,7 +12,7 @@ struct ledPattern{
 };
 ledPattern ledPatterns[] = {
     {1, 0, 1, 0},  // BOOTING
-    {1, 1, 2, 30},  // WIFI_CONNECTED
+    {1, 1, 1, 10},  // WIFI_CONNECTED
     {5, 5, 3, 30},  // WIFI_PROVISIONING
     {1, 1, 1, 50},  // STREAMING
     {0, 0, 0, 1},  // BUTTON_HANDLING

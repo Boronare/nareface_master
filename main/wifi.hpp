@@ -69,7 +69,6 @@ void connect_wifi() {
     size_t password_len = 0;
     if(nvs_get_str(my_handle, "ssid", NULL, &ssid_len)==ESP_ERR_NVS_NOT_FOUND){
         ESP_LOGI("WIFI", "SSID not found in NVS, starting AP mode");
-        start_softap();
     }else{
         nvs_get_str(my_handle, "password", NULL, &password_len);
         ESP_LOGI("WIFI", "Password Length : %u", password_len);

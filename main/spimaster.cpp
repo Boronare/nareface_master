@@ -4,6 +4,7 @@
 #include "mdns.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
+#include "esp_ota_ops.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
@@ -27,9 +28,14 @@ static const char HTML_INDEX[] =
 "<p><label>패스워드 <input type=password name=pass id=pass></label></p>"
 "<p><button type=submit>연결</button></p>"
 "</form>"
+ "<hr><h3>펌웨어 업데이트</h3>"
+ "<input type=file id=fw accept='.bin'/> "
+ "<button onclick='upload()'>업데이트 업로드</button>"
+ "<pre id=log></pre>"
 "<script>"
 "async function scan(){const j=window.__APS||[];const s=document.getElementById('ssidSel');s.innerHTML='';j.forEach(ap=>{const o=document.createElement('option');o.text=ap.ssid+' ('+ap.rssi+')';o.value=ap.ssid;s.add(o)});document.getElementById('aps').innerText='AP수: '+j.length;}"
 "async function submitProv(e){e.preventDefault();const fd=new FormData(document.getElementById('f'));const body=new URLSearchParams(fd).toString();const r=await fetch('/provision',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});alert(r.ok?'저장됨. 연결 시도 중…':'실패');}"
+ "async function upload(){const f=document.getElementById('fw').files[0];if(!f){alert('파일 선택');return;}const log=document.getElementById('log');log.textContent='업로드 중...';try{const r=await fetch('/ota',{method:'POST',body:f});const t=await r.text();log.textContent=t;}catch(e){log.textContent='실패: '+e;}}"
 "scan();""</script>"
 "</body></html>";
 
@@ -101,6 +107,7 @@ static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=12
 static const char* _STREAM_BOUNDARY     = "\r\n--123456789000000000000987654321\r\n";
 static const char* _STREAM_PART         = "Content-Type: image/jpeg\r\nContent-Length: %u\r\nX-Timestamp: %d.%06d\r\n\r\n";
 
+static esp_err_t ota_post_handler(httpd_req_t* req);
 // --- Provisioning HTTP handlers ---
 static esp_err_t index_get_handler(httpd_req_t* req){
     // Arm idle sleep timer on non-stream request
@@ -565,13 +572,14 @@ extern "C" void app_main(void) {
 
     httpd_handle_t stream_httpd = NULL;
     if (httpd_start(&stream_httpd, &config) == ESP_OK) {
-        httpd_uri_t stream_uri[6] = {
+        httpd_uri_t stream_uri[7] = {
             {.uri = "/", .method = HTTP_GET, .handler = index_get_handler, .user_ctx = NULL},
             {.uri = "/status", .method = HTTP_GET, .handler = status_get_handler, .user_ctx = NULL},
             {.uri = "/provision", .method = HTTP_POST, .handler = provision_post_handler, .user_ctx = NULL},
             {.uri = "/left", .method = HTTP_GET, .handler = stream_handler_common, .user_ctx = (void*)0},
             {.uri = "/right", .method = HTTP_GET, .handler = stream_handler_common, .user_ctx = (void*)1},
-            {.uri = "/face", .method = HTTP_GET, .handler = stream_handler_common, .user_ctx = (void*)2}
+            {.uri = "/face", .method = HTTP_GET, .handler = stream_handler_common, .user_ctx = (void*)2},
+            {.uri = "/ota", .method = HTTP_POST, .handler = ota_post_handler, .user_ctx = NULL}
         };
         httpd_register_uri_handler(stream_httpd, &stream_uri[0]);
         httpd_register_uri_handler(stream_httpd, &stream_uri[1]);
@@ -579,7 +587,77 @@ extern "C" void app_main(void) {
         httpd_register_uri_handler(stream_httpd, &stream_uri[3]);
         httpd_register_uri_handler(stream_httpd, &stream_uri[4]);
         httpd_register_uri_handler(stream_httpd, &stream_uri[5]);
+        httpd_register_uri_handler(stream_httpd, &stream_uri[6]);
     // Arm initial idle sleep timer once server is up
     idle_timer_arm_5min();
     }
+}
+
+static esp_err_t ota_post_handler(httpd_req_t* req) {
+    // Cancel idle auto-sleep during OTA
+    idle_timer_cancel();
+
+    const esp_partition_t* update_part = esp_ota_get_next_update_partition(NULL);
+    if (!update_part) {
+        ESP_LOGE(TAG, "No OTA partition available");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no ota partition");
+        idle_timer_arm_5min();
+        return ESP_FAIL;
+    }
+
+    esp_ota_handle_t handle = 0;
+    esp_err_t err = esp_ota_begin(update_part, OTA_SIZE_UNKNOWN, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ota_begin failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota_begin failed");
+        idle_timer_arm_5min();
+        return ESP_FAIL;
+    }
+
+    size_t remaining = req->content_len;
+    uint8_t* buf = (uint8_t*)malloc(4096);
+    while (remaining > 0) {
+        int to_read = remaining > 4096 ? 4096 : (int)remaining;
+        int r = httpd_req_recv(req, (char*)buf, to_read);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue; // retry
+        }
+        if (r <= 0) {
+            ESP_LOGE(TAG, "recv failed: %d", r);
+            esp_ota_end(handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
+            idle_timer_arm_5min();
+            return ESP_FAIL;
+        }
+        err = esp_ota_write(handle, buf, r);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "ota_write failed: %s", esp_err_to_name(err));
+            esp_ota_end(handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota_write failed");
+            idle_timer_arm_5min();
+            return ESP_FAIL;
+        }
+        remaining -= r;
+    }
+    free(buf);
+
+    if ((err = esp_ota_end(handle)) != ESP_OK) {
+        ESP_LOGE(TAG, "ota_end failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota_end failed");
+        idle_timer_arm_5min();
+        return ESP_FAIL;
+    }
+    if ((err = esp_ota_set_boot_partition(update_part)) != ESP_OK) {
+        ESP_LOGE(TAG, "set_boot failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "set_boot failed");
+        idle_timer_arm_5min();
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "OK, rebooting...");
+    ESP_LOGI(TAG, "OTA update written, rebooting");
+    vTaskDelay(pdMS_TO_TICKS(600));
+    esp_restart();
+    return ESP_OK;
 }
