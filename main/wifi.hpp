@@ -6,6 +6,7 @@
 #include <nvs_flash.h>
 #include "esp_netif.h"
 #include "esp_mac.h"
+#include "mdns.h"
 #include <string.h>
 #include "globals.h"
 #include "status.hpp"
@@ -20,6 +21,68 @@
 
 static EventGroupHandle_t s_wifi_event_group;
 
+// Test if a hostname is already in use by attempting mDNS query
+static bool test_hostname_available(const char* hostname) {
+    // Try to query for existing hostname via mDNS
+    esp_ip4_addr_t addr;
+    esp_err_t err = mdns_query_a(hostname, 2000, &addr);
+    
+    if (err == ESP_OK) {
+        ESP_LOGW("WIFI", "Hostname %s.local is already in use (mDNS response received)", hostname);
+        return false;
+    }
+    
+    ESP_LOGI("WIFI", "Hostname %s.local appears to be available (no mDNS response)", hostname);
+    return true;
+}
+
+void mdns_start(){
+    // Initialize mDNS only if connected to WiFi in STA mode and mDNS not already started
+    if (globalStatus & GLOBALSTAT_CONNECTED && !hiddenStatus & HIDDENSTAT_MDNS_INITIALIZED) {
+        ESP_LOGI("WIFI", "Initializing mDNS in STA mode");
+        esp_err_t err = mdns_init();
+        if (err) {
+            ESP_LOGE("WIFI", "mDNS Init failed: %s", esp_err_to_name(err));
+        } else {
+            // Try setting hostname with automatic numbering on conflict
+            char hostname[32];
+            int suffix = 0;
+            bool hostname_set = false;
+            
+            while (!hostname_set && suffix < 100) {
+                if (suffix == 0) {
+                    strcpy(hostname, "nareface");
+                } else {
+                    snprintf(hostname, sizeof(hostname), "nareface%d", suffix);
+                }
+
+                ESP_LOGI("WIFI", "Testing mDNS hostname: %s.local", hostname);
+                
+                // Test if hostname is already in use before setting
+                if (test_hostname_available(hostname)) {
+                    err = mdns_hostname_set(hostname);
+                    
+                    if (err == ESP_OK) {
+                        ESP_LOGI("WIFI", "mDNS hostname set successfully: %s.local", hostname);
+                        hostname_set = true;
+                        hiddenStatus |= HIDDENSTAT_MDNS_INITIALIZED;
+                    } else {
+                        ESP_LOGE("WIFI", "mDNS hostname set failed: %s", esp_err_to_name(err));
+                        break;
+                    }
+                } else {
+                    // Hostname is in use, try next suffix
+                    suffix++;
+                    vTaskDelay(pdMS_TO_TICKS(100)); // Brief delay before retry
+                }
+            }
+            
+            if (!hostname_set) {
+                ESP_LOGE("WIFI", "Failed to set any mDNS hostname after 100 attempts");
+            }
+        }
+    }
+}
 
 /* The event group allows multiple bits for each event,
    but we only care about one event - are we connected
@@ -37,14 +100,23 @@ static EventGroupHandle_t s_wifi_event_group;
     uint8_t softap_manual_start = 0;
 static void start_softap();
 static void stop_softap();
+static void checkStartSoftAP(void* arg) {
+    vTaskDelay(pdMS_TO_TICKS(10000)); // wait 10s
+    if ((xEventGroupGetBits(s_wifi_event_group) & CONNECTED_BIT) == 0) {
+        start_softap();
+    }
+    vTaskDelete(NULL);
+}
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
-        start_softap();
+        xTaskCreate(checkStartSoftAP, "checkStartSoftAP", 2048, NULL, 5, NULL);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        esp_wifi_connect();
+        if(s_ap_running == false && softap_manual_start == 0) {
+            esp_wifi_connect();
+        }
         xEventGroupClearBits(s_wifi_event_group, CONNECTED_BIT);
         globalStatus &= ~GLOBALSTAT_CONNECTED; // not connected
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -52,6 +124,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     if(softap_manual_start == 0) {
         stop_softap();
     }
+    mdns_start();
     xEventGroupSetBits(s_wifi_event_group, CONNECTED_BIT);
     }
 }
@@ -71,15 +144,13 @@ void connect_wifi() {
         ESP_LOGI("WIFI", "SSID not found in NVS, starting AP mode");
     }else{
         nvs_get_str(my_handle, "password", NULL, &password_len);
-        ESP_LOGI("WIFI", "Password Length : %u", password_len);
-        char *ssid = (char *)malloc(32);
-        char *password = (char *)malloc(64);
+        char *ssid = (char *)calloc(32, sizeof(char));
+        char *password = (char *)calloc(64, sizeof(char));
         ESP_ERROR_CHECK(nvs_get_str(my_handle, "ssid", ssid, &ssid_len));
         nvs_get_str(my_handle, "password", password, &password_len);
-        ESP_LOGI("WIFI", "SSID:%s", ssid);
-        ESP_LOGI("WIFI", "PASSWORD:%s", password);
-        memcpy(wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
-        memcpy(wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
+        bzero(&wifi_config, sizeof(wifi_config));
+        strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+        strncpy((char*)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
         free(ssid);
         free(password);
     }
@@ -104,18 +175,23 @@ void connect_wifi() {
     ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_STA) );
     ESP_ERROR_CHECK( esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
     ESP_ERROR_CHECK( esp_wifi_start() );
+    if(ssid_len == 0){
+        ESP_LOGI("WIFI", "No SSID found, starting AP mode");
+        start_softap();
+    }
     ESP_LOGI("WIFI", "WiFi started");
 }
 
 // Start a minimal SoftAP for provisioning UI concurrent with STA
 static void start_softap() {
     if (s_ap_running) return;
-    // Switch to APSTA mode
+    // Switch to AP mode
     globalStatus |= GLOBALSTAT_PROVISIONING;
     wifi_mode_t mode;
     esp_wifi_get_mode(&mode);
     if (mode != WIFI_MODE_APSTA) {
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+        esp_wifi_disconnect(); // disconnect STA if connected
     }
 
     // Create AP netif if needed
@@ -146,6 +222,7 @@ static void stop_softap() {
     esp_wifi_get_mode(&mode);
     if (mode != WIFI_MODE_STA) {
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        esp_wifi_connect(); // reconnect STA if disconnected
     }
     globalStatus &= ~GLOBALSTAT_PROVISIONING;
 }
@@ -192,6 +269,8 @@ static inline esp_err_t wifi_set_credentials_and_connect(const char* ssid, const
     bzero(&wifi_config, sizeof(wifi_config));
     strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
     strncpy((char*)wifi_config.sta.password, pass ? pass : "", sizeof(wifi_config.sta.password));
+    ESP_LOGI("WIFI", "SSID:%s (%u)", ssid, strlen(ssid));
+    ESP_LOGI("WIFI", "PASSWORD:%s (%u)", pass, strlen(pass));
     ESP_ERROR_CHECK( esp_wifi_disconnect() );
     ESP_ERROR_CHECK( esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
     return esp_wifi_connect();

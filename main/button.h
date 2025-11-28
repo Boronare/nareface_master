@@ -10,7 +10,7 @@ void (*triple_click_action)();
 void (*long_press_action)();
 
 void button_task(void* arg) {
-    constexpr int16_t LONG_MS = 3000;       // 3 seconds
+    constexpr int16_t LONG_MS = 1500;       // 1.5 seconds
     constexpr int16_t CLICK_WIN_MS = 700;   // time window for multi-click
     constexpr int16_t DEBOUNCE_MS = 40;     // debounce window
 
@@ -19,14 +19,14 @@ void button_task(void* arg) {
     // Debounce state
     bool raw = (gpio_get_level(PIN_BTN) == 0);
     bool debounced = raw;
-    int64_t last_change = esp_timer_get_time() / 1000; // ms
+    int32_t last_change = esp_timer_get_time() / 1000; // ms
 
-    int64_t press_start = debounced ? last_change : 0;
-    int clicks = 0;
-    int64_t click_deadline = 0;
+    int32_t press_start = debounced ? last_change : 0;
+    uint8_t clicks = 0;
+    int32_t click_deadline = 0;
     for(;;){
         bool new_raw = (gpio_get_level(PIN_BTN) == 0);
-        int64_t now = esp_timer_get_time()/1000;
+        int32_t now = esp_timer_get_time()/1000;
         if (new_raw != raw) {
             raw = new_raw;
             last_change = now; // restart debounce window
@@ -38,10 +38,12 @@ void button_task(void* arg) {
             // Edge processing based on debounced transitions
             if (debounced && !old) { // down edge
                 press_start = now;
-                gpio_set_level(PIN_LED, 1);
+                // LEDW is active low now (on when 0)
+                gpio_set_level(PIN_LEDW, 0);
             }
             if (!debounced && old) { // up edge
-                gpio_set_level(PIN_LED, 0);
+                // Turn LEDW off (inactive high)
+                gpio_set_level(PIN_LEDW, 1);
                 int64_t dur = now - press_start;
                 if (dur < CLICK_WIN_MS && (clicks == 0 || now < click_deadline)) {
                     // short click
@@ -92,7 +94,7 @@ void button_task(void* arg) {
 void IRAM_ATTR button_isr_handler(void* arg) {
     if(globalStatus & GLOBALSTAT_BUTTON_HANDLING) return; // already handling button
     globalStatus |= GLOBALSTAT_BUTTON_HANDLING;
-    xTaskCreate(button_task, "btn_task", 1024, NULL, 5, NULL);
+    xTaskCreate(button_task, "btn_task", 2048, NULL, 5, NULL);
 }
 
 #endif // NAREDEF_BUTTON
