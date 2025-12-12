@@ -1,0 +1,24 @@
+<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'/>
+<title>nareface Wi‑Fi Setup</title>
+<style>body{font-family:sans-serif;margin:12px}button,input,select{font:16px sans-serif;padding:6px}#aps{margin-top:8px}</style>
+</head><body>
+<h2>Wi‑Fi Setting</h2>
+<button onclick=location.reload(true)>AP Scan</button>
+<div id=aps></div>
+<form id=f onsubmit='return submitProv(event)'>
+<p><label>SSID <select id=ssidSel name=ssid></select></label></p>
+<p><label>Password <input type=password name=pass id=pass></label></p>
+<p><button type=submit>Connect</button></p>
+</form>
+<hr><h3>Upload firmware</h3>
+<h4>current version : v1.0.1 251212</h4>
+<input type=file id=fw accept='.bin'/> 
+<button onclick='upload()'>Upload</button>
+<pre id=log></pre>
+<script>
+async function scan(){const j=window.__APS||[];const s=document.getElementById('ssidSel');s.innerHTML='';j.forEach(ap=>{const o=document.createElement('option');o.text=ap.ssid+' ('+ap.rssi+')';o.value=ap.ssid;s.add(o)});document.getElementById('aps').innerText='AP Count: '+j.length;}
+async function submitProv(e){e.preventDefault();const fd=new FormData(document.getElementById('f'));const body=new URLSearchParams(fd).toString();const r=await fetch('/provision',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});alert(r.ok?'Saved. Trying connect…':'Failed');}
+async function upload(){const f=document.getElementById('fw').files[0];if(!f){alert('Select File');return;}const log=document.getElementById('log');log.textContent='Uploading...';try{const r=await fetch('/ota',{method:'POST',body:f});const t=await r.text();log.textContent=t;}catch(e){log.textContent='Failed: '+e;}}
+scan();
+</script>
+</body></html>

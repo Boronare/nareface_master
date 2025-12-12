@@ -41,7 +41,7 @@ static uint16_t idle_counter = 30;
 #define GPIO_SCLK 2
 #define GPIO_CS1 4
 #define GPIO_CS2 10
-#define GPIO_CS3 9
+#define GPIO_CS3 GPIO_NUM_9
 #define PIN_BTN GPIO_NUM_5
 #define PIN_LEDW GPIO_NUM_8
 #define PIN_LEDP GPIO_NUM_0
