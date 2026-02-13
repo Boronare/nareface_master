@@ -157,7 +157,8 @@ static void powStatusTask(void* arg) {
             i=10;
         } else {
             //deep sleep
-            enter_deep_sleep_wait_button();
+            // enter_deep_sleep_wait_button();
+            i=10;
         }
         // blink LED according to battery level
         vTaskDelay(pdMS_TO_TICKS(2000-200*i));

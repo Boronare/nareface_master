@@ -1,24 +1,41 @@
 <!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'/>
 <title>nareface Wi‑Fi Setup</title>
-<style>body{font-family:sans-serif;margin:12px}button,input,select{font:16px sans-serif;padding:6px}#aps{margin-top:8px}</style>
+<style>body{font-family:sans-serif;margin:12px}button,input,select{font:16px sans-serif;padding:6px}.radio-group{margin:8px 0}.hidden{display:none}</style>
 </head><body>
-<h2>Wi‑Fi Setting</h2>
+<h2>Setting</h2>
+<div id="dProv">
 <button onclick=location.reload(true)>AP Scan</button>
-<div id=aps></div>
 <form id=f onsubmit='return submitProv(event)'>
-<p><label>SSID <select id=ssidSel name=ssid></select></label></p>
-<p><label>Password <input type=password name=pass id=pass></label></p>
+<div class=radio-group>
+<label><input type=radio name=ssidMode value=select checked onchange='toggleSsidInput()'> Select from scan list</label><br>
+<label><input type=radio name=ssidMode value=manual onchange='toggleSsidInput()'> Enter manually (for hidden SSID)</label>
+</div>
+<p id=selectGroup><label>SSID <select id=ssidSel></select></label></p>
+<p id=manualGroup style='display:none'><label>SSID <input type=text id=ssidManual size=32 placeholder='Enter SSID'></label></p>
+<p><label>Password <input type=password name=pass id=pass size=64></label></p>
 <p><button type=submit>Connect</button></p>
 </form>
+</div>
+<div id="dSettings" class="hidden">
+<form id=mdnsForm onsubmit='return submitSettings(event)'>
+<p><label>mDNS Service Name <input type=text name=mdns id=mdns size=32 placeholder='nareface'>.local</label></p>
+<p><button type=submit>Update</button></p>
+</form>
+Battery State : <label id="soc"></label>
 <hr><h3>Upload firmware</h3>
-<h4>current version : v1.0.1 251212</h4>
+<h4>current version : v1.0.1 260121</h4>
 <input type=file id=fw accept='.bin'/> 
 <button onclick='upload()'>Upload</button>
 <pre id=log></pre>
+</div>
 <script>
+function toggleSsidInput(){const mode=document.querySelector('input[name=ssidMode]:checked').value;document.getElementById('selectGroup').style.display=mode==='select'?'block':'none';document.getElementById('manualGroup').style.display=mode==='manual'?'block':'none';}
 async function scan(){const j=window.__APS||[];const s=document.getElementById('ssidSel');s.innerHTML='';j.forEach(ap=>{const o=document.createElement('option');o.text=ap.ssid+' ('+ap.rssi+')';o.value=ap.ssid;s.add(o)});document.getElementById('aps').innerText='AP Count: '+j.length;}
-async function submitProv(e){e.preventDefault();const fd=new FormData(document.getElementById('f'));const body=new URLSearchParams(fd).toString();const r=await fetch('/provision',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});alert(r.ok?'Saved. Trying connect…':'Failed');}
+async function submitProv(e){e.preventDefault();const mode=document.querySelector('input[name=ssidMode]:checked').value;const ssid=mode==='select'?document.getElementById('ssidSel').value:document.getElementById('ssidManual').value;if(!ssid){alert('Enter SSID');return;}const pass=document.getElementById('pass').value;const body=new URLSearchParams({ssid:ssid,pass:pass}).toString();const r=await fetch('/provision',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});alert(r.ok?'Saved. Trying connect…':'Failed');}
+async function submitSettings(e){e.preventDefault();const mdns=document.getElementById('mdns').value;const body=new URLSearchParams({mdns:mdns}).toString();const r=await fetch('/provision',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});alert(r.ok?'Saved. Trying connect…':'Failed');}
 async function upload(){const f=document.getElementById('fw').files[0];if(!f){alert('Select File');return;}const log=document.getElementById('log');log.textContent='Uploading...';try{const r=await fetch('/ota',{method:'POST',body:f});const t=await r.text();log.textContent=t;}catch(e){log.textContent='Failed: '+e;}}
-scan();
+if(!window.__APS){document.getElementById('dProv').classList.add('hidden');document.getElementById('dSettings').classList.remove('hidden');}
+else scan();
+(()=>{document.getElementById('soc').innerText=window.__SOC+'%';})();
 </script>
 </body></html>

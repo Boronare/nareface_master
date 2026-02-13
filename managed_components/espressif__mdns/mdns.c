@@ -33,7 +33,7 @@ static void _mdns_browse_send(mdns_browse_t *browse, mdns_if_t interface);
 #if ESP_IDF_VERSION <= ESP_IDF_VERSION_VAL(5, 1, 0)
 #define MDNS_ESP_WIFI_ENABLED CONFIG_SOC_WIFI_SUPPORTED
 #else
-#define MDNS_ESP_WIFI_ENABLED CONFIG_ESP_WIFI_ENABLED
+#define MDNS_ESP_WIFI_ENABLED (CONFIG_ESP_WIFI_ENABLED || CONFIG_ESP_WIFI_REMOTE_ENABLED)
 #endif
 
 #if MDNS_ESP_WIFI_ENABLED && (CONFIG_MDNS_PREDEF_NETIF_STA || CONFIG_MDNS_PREDEF_NETIF_AP)
@@ -1795,8 +1795,8 @@ static bool _mdns_create_answer_from_service(mdns_tx_packet_t *packet, mdns_serv
         // According to RFC6763-section12.1, for DNS-SD, SRV, TXT and all address records
         // should be included in additional records.
         if (!_mdns_alloc_answer(&packet->answers, MDNS_TYPE_PTR, service, NULL, false, false) ||
-                !_mdns_alloc_answer(is_delegated ? &packet->additional : &packet->answers, MDNS_TYPE_SRV, service, NULL, send_flush, false) ||
-                !_mdns_alloc_answer(is_delegated ? &packet->additional : &packet->answers, MDNS_TYPE_TXT, service, NULL, send_flush, false) ||
+                !_mdns_alloc_answer(&packet->additional, MDNS_TYPE_SRV, service, NULL, send_flush, false) ||
+                !_mdns_alloc_answer(&packet->additional, MDNS_TYPE_TXT, service, NULL, send_flush, false) ||
                 !_mdns_alloc_answer((shared || is_delegated) ? &packet->additional : &packet->answers, MDNS_TYPE_A, service, host, send_flush,
                                     false) ||
                 !_mdns_alloc_answer((shared || is_delegated) ? &packet->additional : &packet->answers, MDNS_TYPE_AAAA, service, host,
@@ -2656,13 +2656,18 @@ static mdns_txt_linked_item_t *_mdns_allocate_txt(size_t num_items, mdns_txt_ite
                 mdns_mem_free(new_item);
                 break;
             }
-            new_item->value = mdns_mem_strdup(txt[i].value);
-            if (!new_item->value) {
-                mdns_mem_free((char *)new_item->key);
-                mdns_mem_free(new_item);
-                break;
+            if (txt[i].value) {
+                new_item->value = mdns_mem_strdup(txt[i].value);
+                if (!new_item->value) {
+                    mdns_mem_free((char *)new_item->key);
+                    mdns_mem_free(new_item);
+                    break;
+                }
+                new_item->value_len = strlen(new_item->value);
+            } else {
+                new_item->value = NULL;
+                new_item->value_len = 0;
             }
-            new_item->value_len = strlen(new_item->value);
             new_item->next = new_txt;
             new_txt = new_item;
         }
@@ -4488,9 +4493,9 @@ void mdns_preset_if_handle_system_event(void *arg, esp_event_base_t event_base,
         return;
     }
 
-    esp_netif_dhcp_status_t dcst;
 #if MDNS_ESP_WIFI_ENABLED && (CONFIG_MDNS_PREDEF_NETIF_STA || CONFIG_MDNS_PREDEF_NETIF_AP)
     if (event_base == WIFI_EVENT) {
+        esp_netif_dhcp_status_t dcst;
         switch (event_id) {
         case WIFI_EVENT_STA_CONNECTED:
             if (!esp_netif_dhcpc_get_status(esp_netif_from_preset_if(MDNS_IF_STA), &dcst)) {
@@ -4517,6 +4522,7 @@ void mdns_preset_if_handle_system_event(void *arg, esp_event_base_t event_base,
 #endif
 #if CONFIG_ETH_ENABLED && CONFIG_MDNS_PREDEF_NETIF_ETH
         if (event_base == ETH_EVENT) {
+            esp_netif_dhcp_status_t dcst;
             switch (event_id) {
             case ETHERNET_EVENT_CONNECTED:
                 if (!esp_netif_dhcpc_get_status(esp_netif_from_preset_if(MDNS_IF_ETH), &dcst)) {

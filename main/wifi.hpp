@@ -20,7 +20,7 @@
 #define PROV_AP_CHANNEL 6
 
 static EventGroupHandle_t s_wifi_event_group;
-
+char *mdnsServiceName = strdup("nareface");
 // Test if a hostname is already in use by attempting mDNS query
 static bool test_hostname_available(const char* hostname) {
     // Try to query for existing hostname via mDNS
@@ -37,6 +37,27 @@ static bool test_hostname_available(const char* hostname) {
 }
 
 void mdns_start(){
+    // find mdnsServiceName from nvs
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("storage", NVS_READONLY, &nvs_handle);
+    if (err == ESP_OK) {
+        size_t required_size = 0;
+        err = nvs_get_str(nvs_handle, "mdns_name", NULL, &required_size);
+        if (err == ESP_OK && required_size > 1) {
+            char* stored_name = (char*)malloc(required_size);
+            if (stored_name) {
+                err = nvs_get_str(nvs_handle, "mdns_name", stored_name, &required_size);
+                if (err == ESP_OK) {
+                    free(mdnsServiceName);
+                    mdnsServiceName = stored_name;
+                    ESP_LOGI("WIFI", "Loaded mDNS service name from NVS: %s", mdnsServiceName);
+                } else {
+                    free(stored_name);
+                }
+            }
+        }
+        nvs_close(nvs_handle);
+    }
     // Initialize mDNS only if connected to WiFi in STA mode and mDNS not already started
     if (globalStatus & GLOBALSTAT_CONNECTED && !hiddenStatus & HIDDENSTAT_MDNS_INITIALIZED) {
         ESP_LOGI("WIFI", "Initializing mDNS in STA mode");
@@ -51,9 +72,9 @@ void mdns_start(){
             
             while (!hostname_set && suffix < 100) {
                 if (suffix == 0) {
-                    strcpy(hostname, "nareface");
+                    strcpy(hostname, mdnsServiceName);
                 } else {
-                    snprintf(hostname, sizeof(hostname), "nareface%d", suffix);
+                    snprintf(hostname, sizeof(hostname), "%s%d", mdnsServiceName, suffix);
                 }
 
                 ESP_LOGI("WIFI", "Testing mDNS hostname: %s.local", hostname);
@@ -80,6 +101,10 @@ void mdns_start(){
             if (!hostname_set) {
                 ESP_LOGE("WIFI", "Failed to set any mDNS hostname after 100 attempts");
             }
+            mdns_instance_name_set(mdnsServiceName);
+            // Broadcast mdns as http server
+            mdns_service_add(mdnsServiceName, "_http", "_tcp", 80, NULL, 0);
+            
         }
     }
 }
@@ -162,6 +187,11 @@ void connect_wifi() {
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
     assert(sta_netif);
+    
+    // Set DHCP hostname for router display
+    ESP_ERROR_CHECK(esp_netif_set_hostname(sta_netif, "nareface"));
+    ESP_LOGI("WIFI", "DHCP hostname set to 'nareface'");
+    
     ESP_LOGI("WIFI", "Default WiFi STA interface created");
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();

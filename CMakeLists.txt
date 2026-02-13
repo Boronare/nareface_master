@@ -7,4 +7,4 @@ set(PROJECT_NAME "nareface")
 set(PROJECT_VER "1.0.0")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(${PROJECT_NAME})
+project("nareface")

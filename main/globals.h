@@ -1,6 +1,5 @@
 #ifndef NAREDEF_GLOBALS
 #define NAREDEF_GLOBALS
-#include <cstdint>
 #include "driver/gpio.h"
 #include "esp_log.h"
 
@@ -15,9 +14,9 @@
 
 #define HIDDENSTAT_MDNS_INITIALIZED 1
 
-uint8_t globalStatus = 0;
-uint8_t hiddenStatus = 0;
-uint16_t curBat = 0; // filtered battery voltage in mV
+static uint8_t globalStatus = 0;
+static uint8_t hiddenStatus = 0;
+static uint16_t curBat = 0; // filtered battery voltage in mV
 
 static uint16_t idle_counter = 30;
 
@@ -39,8 +38,8 @@ static uint16_t idle_counter = 30;
 // #define GPIO_SCLK 6
 #define GPIO_MISO 6
 #define GPIO_SCLK 2
-#define GPIO_CS1 4
-#define GPIO_CS2 10
+#define GPIO_CS1 GPIO_NUM_4
+#define GPIO_CS2 GPIO_NUM_10
 #define GPIO_CS3 GPIO_NUM_9
 #define PIN_BTN GPIO_NUM_5
 #define PIN_LEDW GPIO_NUM_8

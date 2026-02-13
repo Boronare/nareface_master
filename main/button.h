@@ -63,7 +63,11 @@ void button_task(void* arg) {
 
         // Long-press while held (debounced)
         if (clicks == 0 && debounced && press_start && (now - press_start >= LONG_MS)) {
+            while(gpio_get_level(PIN_BTN) == 0){
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
             if(long_press_action != nullptr)
+            gpio_set_level(PIN_LEDW, 0); // Turn off LEDW (inactive high)
                 long_press_action();
             press_start = 0; // prevent repeat            
         }

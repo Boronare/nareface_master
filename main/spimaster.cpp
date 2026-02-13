@@ -38,6 +38,10 @@ static TaskHandle_t        stream_task_handle[3] = { nullptr, nullptr, nullptr }
 
 void idle_timer_task(void* arg) {
     while(1){
+        //if mdns initialized
+        if(hiddenStatus & HIDDENSTAT_MDNS_INITIALIZED) {
+            mdns_service_txt_item_set("_http", "_tcp", "status", "active");
+        }
         if(idle_counter > 0) idle_counter--;
         else enter_deep_sleep_wait_button();
         vTaskDelay(pdMS_TO_TICKS(10000));
@@ -57,8 +61,7 @@ struct spijpeg_pack{
 
 constexpr int jpegbuf_size = sizeof(spijpeg_pack);
 
-constexpr int target_fps = 30;
-constexpr int target_frame_time = 40; // ms per frame (approx)
+constexpr int target_frame_time = 45; // ms per frame (approx)
 
 spijpeg_pack* spi_buffer[3];
 // SemaphoreHandle_t jpeg_semaphore;
@@ -105,20 +108,67 @@ static esp_err_t index_get_handler(httpd_req_t* req){
     httpd_resp_set_type(req, "text/html");
     // Stream in chunks to reduce memory pressure
     // Prepend embedded scan results as window.__APS
+    httpd_resp_sendstr_chunk(req, "<script>");
     if(s_ap_running) {
         wifi_scan_now();
         const wifi_ap_record_t* recs = wifi_scan_records();
         uint16_t n = wifi_scan_count();
-        httpd_resp_sendstr_chunk(req, "<script>window.__APS=");
+        httpd_resp_sendstr_chunk(req, "window.__APS=");
         httpd_resp_sendstr_chunk(req, "[");
         for (uint16_t i=0;i<n;i++){
             char ssid[33]={0}; memcpy(ssid, recs[i].ssid, 32);
             char item[96];
-            int len = snprintf(item, sizeof(item), "%s{\"ssid\":\"%s\",\"rssi\":%d}", i?",":"", ssid, recs[i].rssi);
+            uint8_t len = snprintf(item, sizeof(item), "%s{\"ssid\":\"%s\",\"rssi\":%d}", i?",":"", ssid, recs[i].rssi);
             httpd_resp_send_chunk(req, item, len);
         }
-        httpd_resp_sendstr_chunk(req, "];</script>");
+        httpd_resp_sendstr_chunk(req, "];");
     }
+        uint8_t soc = 0;
+    // if (vbat <= 3.3f) soc = 0;
+    // else if (vbat >= 4.2f) soc = 100;
+    // else soc = (vbat - 3.3f) / (4.2f - 3.3f) * 100.0f * vbat/4.2; // simple linear
+    //1% step lookup table
+    {
+        static const uint16_t soc_table[100] = {
+            // 1% ~ 10%
+            3320, 3340, 3370, 3390, 3410, 3430, 3450, 3470, 3480, 3500,
+            // 11% ~ 20%
+            3510, 3520, 3540, 3550, 3560, 3570, 3580, 3590, 3600, 3610,
+            // 21% ~ 30%
+            3620, 3630, 3635, 3640, 3650, 3660, 3665, 3670, 3675, 3680,
+            // 31% ~ 40%
+            3690, 3695, 3700, 3705, 3710, 3720, 3725, 3730, 3735, 3740,
+            // 41% ~ 50%
+            3750, 3755, 3760, 3765, 3770, 3780, 3785, 3790, 3795, 3800,
+            // 51% ~ 60%
+            3810, 3815, 3820, 3825, 3830, 3840, 3845, 3850, 3855, 3860,
+            // 61% ~ 70%
+            3870, 3875, 3880, 3885, 3890, 3900, 3905, 3910, 3915, 3920,
+            // 71% ~ 80%
+            3930, 3940, 3945, 3950, 3960, 3970, 3975, 3980, 3990, 4000,
+            // 81% ~ 90%
+            4010, 4020, 4025, 4030, 4040, 4050, 4060, 4070, 4090, 4100,
+            // 91% ~ 100%
+            4110, 4120, 4130, 4140, 4150, 4160, 4170, 4180, 4190, 4200
+        };
+        for(int8_t i=9;i>=0;i--){
+            if(curBat >= soc_table[i*10]){
+                for(int8_t j=9;j>=0;j--){
+                    int idx = i*10 + j;
+                    if(curBat >= soc_table[idx]){
+                        soc = idx + 1;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        char buf[64];
+        uint8_t len = snprintf(buf, sizeof(buf), "window.__VBAT=%d;window.__SOC=%d;window.__MDNS=\"%s\";", curBat, soc, mdnsServiceName);
+        httpd_resp_send_chunk(req, buf, len );
+    }
+    httpd_resp_sendstr_chunk(req, "</script>");
+    
     const char* p = HTML_INDEX;
     while (*p) {
         size_t len = strlen(p);
@@ -170,7 +220,7 @@ static esp_err_t provision_post_handler(httpd_req_t* req){
     if (total == 0) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
 
     // Parse ssid=...&pass=... and URL-decode
-    char ssid[33]={0}; char pass[65]={0};
+    char ssid[33]={0}; char pass[65]={0}; char mdns[33]={0};
     const char* p = strstr(content, "ssid=");
     if (p){
         p += 5; const char* e = p; while (*e && *e!='&') e++;
@@ -181,62 +231,37 @@ static esp_err_t provision_post_handler(httpd_req_t* req){
         p += 5; const char* e = p; while (*e && *e!='&') e++;
         url_decode_to(pass, sizeof(pass), p, (size_t)(e-p));
     }
+    p = strstr(content, "mdns=");
+    if (p){
+        p += 5; const char* e = p; while (*e && *e!='&') e++;
+        url_decode_to(mdns, sizeof(mdns), p, (size_t)(e-p));
+    }
     softap_manual_start = 0;
-    wifi_save_credentials_to_nvs(ssid, pass);
-    wifi_set_credentials_and_connect(ssid, pass);
+    if(strlen(ssid) > 0){
+        wifi_save_credentials_to_nvs(ssid, pass);
+        wifi_set_credentials_and_connect(ssid, pass);
+    }
+    if(strlen(mdns) > 0){
+        esp_err_t err = nvs_flash_init_partition("nvs");
+        if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+            ESP_ERROR_CHECK(nvs_flash_erase_partition("nvs"));
+            err = nvs_flash_init_partition("nvs");
+        }
+        if (err != ESP_OK) return err;
+        nvs_handle_t my_handle = 0;
+        err = nvs_open("storage", NVS_READWRITE, &my_handle);
+        if (err != ESP_OK) return err;
+        err = nvs_set_str(my_handle, "mdns_name", mdns);
+        if (err == ESP_OK) {
+            err = nvs_commit(my_handle);
+        }
+        nvs_close(my_handle);
+        free(mdnsServiceName);
+        mdnsServiceName = strdup(mdns);
+        mdns_hostname_set(mdns);
+    }
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
-}
-
-static esp_err_t status_get_handler(httpd_req_t* req){
-    // Arm idle sleep timer on non-stream request
-    idle_timer_arm_5min();
-    httpd_resp_set_type(req, "application/json");
-    // uint16_t vbat = read_battery_voltage_mv();
-    // Rough SoC estimation from voltage (Li-ion approximation)
-    uint8_t soc = 0;
-    // if (vbat <= 3.3f) soc = 0;
-    // else if (vbat >= 4.2f) soc = 100;
-    // else soc = (vbat - 3.3f) / (4.2f - 3.3f) * 100.0f * vbat/4.2; // simple linear
-    //1% step lookup table
-    static const uint16_t soc_table[100] = {
-        // 1% ~ 10%
-        3320, 3340, 3370, 3390, 3410, 3430, 3450, 3470, 3480, 3500,
-        // 11% ~ 20%
-        3510, 3520, 3540, 3550, 3560, 3570, 3580, 3590, 3600, 3610,
-        // 21% ~ 30%
-        3620, 3630, 3635, 3640, 3650, 3660, 3665, 3670, 3675, 3680,
-        // 31% ~ 40%
-        3690, 3695, 3700, 3705, 3710, 3720, 3725, 3730, 3735, 3740,
-        // 41% ~ 50%
-        3750, 3755, 3760, 3765, 3770, 3780, 3785, 3790, 3795, 3800,
-        // 51% ~ 60%
-        3810, 3815, 3820, 3825, 3830, 3840, 3845, 3850, 3855, 3860,
-        // 61% ~ 70%
-        3870, 3875, 3880, 3885, 3890, 3900, 3905, 3910, 3915, 3920,
-        // 71% ~ 80%
-        3930, 3940, 3945, 3950, 3960, 3970, 3975, 3980, 3990, 4000,
-        // 81% ~ 90%
-        4010, 4020, 4025, 4030, 4040, 4050, 4060, 4070, 4090, 4100,
-        // 91% ~ 100%
-        4110, 4120, 4130, 4140, 4150, 4160, 4170, 4180, 4190, 4200
-    };
-    for(int8_t i=9;i>=0;i--){
-        if(curBat >= soc_table[i*10]){
-            for(int8_t j=9;j>=0;j--){
-                int idx = i*10 + j;
-                if(curBat >= soc_table[idx]){
-                    soc = idx + 1;
-                    break;
-                }
-            }
-            break;
-        }
-    }
-    char buf[96];
-    // output : vbat, soc, free(memory)
-    int len = snprintf(buf, sizeof(buf), "{\"vbat\":%d,\"soc\":%d,\"free\":%lu}", curBat, soc, esp_get_free_heap_size());
-    return httpd_resp_send(req, buf, len);
 }
 
 static esp_err_t spistream_handler(httpd_req_t* req, uint8_t spi_num) {
@@ -547,7 +572,7 @@ extern "C" void app_main(void) {
 
     ESP_LOGI(TAG, "SPI Master initialized successfully");
 
-
+    // JPEG 버퍼 할당
     for (int i = 0; i < 3; i++) {
         spi_buffer[i] = (spijpeg_pack*)heap_caps_malloc(jpegbuf_size, MALLOC_CAP_DMA);
         if (!spi_buffer[i]) {
@@ -585,7 +610,7 @@ extern "C" void app_main(void) {
 
     // Start button handler
     xTaskCreate(ledStatusTask, "led_status_task", 1024, NULL, 5, NULL);
-    // xTaskCreate(idle_timer_task, "idle_timer_task", 1024, NULL, 5, NULL);
+    xTaskCreate(idle_timer_task, "idle_timer_task", 1024, NULL, 5, NULL);
     xTaskCreate(powStatusTask, "pow_status_task", 1024, NULL, 5, NULL);
 
     // connect to WiFi
@@ -601,28 +626,22 @@ extern "C" void app_main(void) {
     config.recv_wait_timeout = 10;
 
     httpd_handle_t stream_httpd = NULL;
+    constexpr uint8_t uri_handlers = 6 ;
     if (httpd_start(&stream_httpd, &config) == ESP_OK) {
-        httpd_uri_t stream_uri[7] = {
+        httpd_uri_t stream_uri[uri_handlers] = {
             {.uri = "/", .method = HTTP_GET, .handler = index_get_handler, .user_ctx = NULL},
-            {.uri = "/status", .method = HTTP_GET, .handler = status_get_handler, .user_ctx = NULL},
             {.uri = "/provision", .method = HTTP_POST, .handler = provision_post_handler, .user_ctx = NULL},
             {.uri = "/left", .method = HTTP_GET, .handler = stream_handler_common, .user_ctx = (void*)0},
             {.uri = "/right", .method = HTTP_GET, .handler = stream_handler_common, .user_ctx = (void*)1},
             {.uri = "/face", .method = HTTP_GET, .handler = stream_handler_common, .user_ctx = (void*)2},
             {.uri = "/ota", .method = HTTP_POST, .handler = ota_post_handler, .user_ctx = NULL}
         };
-        httpd_register_uri_handler(stream_httpd, &stream_uri[0]);
-        httpd_register_uri_handler(stream_httpd, &stream_uri[1]);
-        httpd_register_uri_handler(stream_httpd, &stream_uri[2]);
-        httpd_register_uri_handler(stream_httpd, &stream_uri[3]);
-        httpd_register_uri_handler(stream_httpd, &stream_uri[4]);
-        httpd_register_uri_handler(stream_httpd, &stream_uri[5]);
-        httpd_register_uri_handler(stream_httpd, &stream_uri[6]);
+        for(int i=0;i<uri_handlers;i++)
+            httpd_register_uri_handler(stream_httpd, &stream_uri[i]);
     // Arm initial idle sleep timer once server is up
     idle_timer_arm_5min();
     }
 }
-
 static esp_err_t ota_post_handler(httpd_req_t* req) {
     idle_timer_cancel();
 
