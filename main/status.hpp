@@ -142,9 +142,9 @@ static void powStatusTask(void* arg) {
     while (true) {
         //get voltage level from pin ADC
         int16_t vbat = read_battery_voltage_mv();
-        // put oneEuroFilter then get result
+        // put filter then get result
         if(!curBat) curBat = vbat;
-        curBat = (curBat*15 + vbat)/16;
+        curBat = (curBat*7 + vbat)/8;
         uint8_t i;
         // vbat level have 5 levels : >4.0V, 3.7~4.0V, 3.5~3.7V, 3.3~3.5V, <3.3V
         if (curBat > 3900) {
@@ -157,7 +157,7 @@ static void powStatusTask(void* arg) {
             i=10;
         } else {
             //deep sleep
-            // enter_deep_sleep_wait_button();
+            enter_deep_sleep_wait_button();
             i=10;
         }
         // blink LED according to battery level

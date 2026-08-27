@@ -19,6 +19,9 @@
 #define PROV_AP_PASSWORD ""
 #define PROV_AP_CHANNEL 6
 
+#define DEFAULT_STA_SSID ""
+#define DEFAULT_STA_PASSWORD ""
+
 static EventGroupHandle_t s_wifi_event_group;
 char *mdnsServiceName = strdup("nareface");
 // Test if a hostname is already in use by attempting mDNS query
@@ -147,7 +150,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
     globalStatus |= GLOBALSTAT_CONNECTED; // connected
     if(softap_manual_start == 0) {
-        stop_softap();
+        // Delay stopping SoftAP so the provisioning browser can still reach /ip
+        xTaskCreate([](void*){
+            vTaskDelay(pdMS_TO_TICKS(12000)); // keep AP alive 12s for browser to read IP
+            stop_softap();
+            vTaskDelete(NULL);
+        }, "stop_ap_delay", 1024, NULL, 3, NULL);
     }
     mdns_start();
     xEventGroupSetBits(s_wifi_event_group, CONNECTED_BIT);
@@ -167,7 +175,13 @@ void connect_wifi() {
     size_t password_len = 0;
     if(nvs_get_str(my_handle, "ssid", NULL, &ssid_len)==ESP_ERR_NVS_NOT_FOUND){
         ESP_LOGI("WIFI", "SSID not found in NVS, starting AP mode");
-    }else{
+            // Set default SSID and password
+            char *ssid = (char *)DEFAULT_STA_SSID;
+            char *password = (char *)DEFAULT_STA_PASSWORD;
+            strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+            strncpy((char*)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
+            ssid_len = strlen(ssid);
+    } else {
         nvs_get_str(my_handle, "password", NULL, &password_len);
         char *ssid = (char *)calloc(32, sizeof(char));
         char *password = (char *)calloc(64, sizeof(char));
@@ -220,6 +234,7 @@ static void start_softap() {
     wifi_mode_t mode;
     esp_wifi_get_mode(&mode);
     if (mode != WIFI_MODE_APSTA) {
+        s_ap_running = true;
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
         esp_wifi_disconnect(); // disconnect STA if connected
     }

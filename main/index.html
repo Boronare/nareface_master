@@ -14,6 +14,7 @@
 <p id=manualGroup style='display:none'><label>SSID <input type=text id=ssidManual size=32 placeholder='Enter SSID'></label></p>
 <p><label>Password <input type=password name=pass id=pass size=64></label></p>
 <p><button type=submit>Connect</button></p>
+<pre id="provLog"></pre>
 </form>
 </div>
 <div id="dSettings" class="hidden">
@@ -23,7 +24,7 @@
 </form>
 Battery State : <label id="soc"></label>
 <hr><h3>Upload firmware</h3>
-<h4>current version : v1.0.1 260121</h4>
+<h4>current version : v1.0.3 260708</h4>
 <input type=file id=fw accept='.bin'/> 
 <button onclick='upload()'>Upload</button>
 <pre id=log></pre>
@@ -31,7 +32,7 @@ Battery State : <label id="soc"></label>
 <script>
 function toggleSsidInput(){const mode=document.querySelector('input[name=ssidMode]:checked').value;document.getElementById('selectGroup').style.display=mode==='select'?'block':'none';document.getElementById('manualGroup').style.display=mode==='manual'?'block':'none';}
 async function scan(){const j=window.__APS||[];const s=document.getElementById('ssidSel');s.innerHTML='';j.forEach(ap=>{const o=document.createElement('option');o.text=ap.ssid+' ('+ap.rssi+')';o.value=ap.ssid;s.add(o)});document.getElementById('aps').innerText='AP Count: '+j.length;}
-async function submitProv(e){e.preventDefault();const mode=document.querySelector('input[name=ssidMode]:checked').value;const ssid=mode==='select'?document.getElementById('ssidSel').value:document.getElementById('ssidManual').value;if(!ssid){alert('Enter SSID');return;}const pass=document.getElementById('pass').value;const body=new URLSearchParams({ssid:ssid,pass:pass}).toString();const r=await fetch('/provision',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});alert(r.ok?'Saved. Trying connect…':'Failed');}
+async function submitProv(e){e.preventDefault();const mode=document.querySelector('input[name=ssidMode]:checked').value;const ssid=mode==='select'?document.getElementById('ssidSel').value:document.getElementById('ssidManual').value;if(!ssid){alert('Enter SSID');return;}const pass=document.getElementById('pass').value;const body=new URLSearchParams({ssid:ssid,pass:pass}).toString();const log=document.getElementById('provLog');log.textContent='Connecting...';const r=await fetch('/provision',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});if(!r.ok){alert('연결 실패');log.textContent='자격증명 전송 실패.';return;}let ok=false;for(let i=0;i<15;i++){await new Promise(res=>setTimeout(res,1000));try{const s=await fetch('/ip');if(s.ok){const j=await s.json();if(j.connected){ok=true;alert('Connected! IP: '+j.ip);log.textContent='Connected: '+j.ip;break;}}}catch(_){}log.textContent='Connecting... ('+(i+1)+'s)';}if(!ok){alert('Connection failed');log.textContent='Connection failed.';}}
 async function submitSettings(e){e.preventDefault();const mdns=document.getElementById('mdns').value;const body=new URLSearchParams({mdns:mdns}).toString();const r=await fetch('/provision',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});alert(r.ok?'Saved. Trying connect…':'Failed');}
 async function upload(){const f=document.getElementById('fw').files[0];if(!f){alert('Select File');return;}const log=document.getElementById('log');log.textContent='Uploading...';try{const r=await fetch('/ota',{method:'POST',body:f});const t=await r.text();log.textContent=t;}catch(e){log.textContent='Failed: '+e;}}
 if(!window.__APS){document.getElementById('dProv').classList.add('hidden');document.getElementById('dSettings').classList.remove('hidden');}

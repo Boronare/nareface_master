@@ -10,6 +10,7 @@ idf_component_register(SRCS "spimaster.cpp"
                         nvs_flash
                         driver
                         mdns
+                        lwip
                     INCLUDE_DIRS ".")
 
 # Embed binary files directly

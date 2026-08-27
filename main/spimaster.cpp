@@ -49,7 +49,12 @@ void idle_timer_task(void* arg) {
 }
 static inline void idle_timer_cancel() { idle_counter = 65535; } //Sleep timer to 182hrs(Max)
 
-static inline void idle_timer_arm_5min() { if(!flags) idle_counter = 30; }
+// Only arm the sleep countdown when nothing is actually streaming. `flags`
+// covers browser MJPEG streams; GLOBALSTAT_STREAMING additionally covers the
+// PaperTracker UDP path, which has no HTTP request to keep the timer at bay.
+static inline void idle_timer_arm_5min() {
+    if(!flags && !(globalStatus & GLOBALSTAT_STREAMING)) idle_counter = 30;
+}
 
 // SPI handle
 spi_device_handle_t spi_handle[3];
@@ -95,6 +100,31 @@ void waitFrameTime(uint8_t devnum){
     lasttime[devnum] = (esp_timer_get_time()/1000)%65536;
 }
 
+#include "pt_udp.hpp"
+
+/**
+ * Read one validated JPEG for a camera index, for the PaperTracker UDP path.
+ * Browser streams claim their `flags` bit before starting, and the PT stream
+ * task stands down while any bit is set, so spi_buffer is ours for the call.
+ */
+static bool pt_fetch_frame(uint8_t index, const uint8_t** out, uint16_t* len) {
+    if (index > 2) return false;
+
+    spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length    = jpegbuf_size * 8;
+    t.rx_buffer = spi_buffer[index];
+    if (spi_device_transmit(spi_handle[index], &t) != ESP_OK) return false;
+
+    uint16_t size = spi_buffer[index]->size;
+    if (size == 0 || size > sizeof(spi_buffer[index]->bytes)) return false;
+    if (spi_buffer[index]->bytes[0] != 0xFF || spi_buffer[index]->bytes[1] != 0xD8) return false;
+
+    *out = spi_buffer[index]->bytes;
+    *len = size;
+    return true;
+}
+
 // HTTP streaming
 static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=123456789000000000000987654321";
 static const char* _STREAM_BOUNDARY     = "\r\n--123456789000000000000987654321\r\n";
@@ -110,6 +140,7 @@ static esp_err_t index_get_handler(httpd_req_t* req){
     // Prepend embedded scan results as window.__APS
     httpd_resp_sendstr_chunk(req, "<script>");
     if(s_ap_running) {
+        esp_wifi_disconnect();
         wifi_scan_now();
         const wifi_ap_record_t* recs = wifi_scan_records();
         uint16_t n = wifi_scan_count();
@@ -264,6 +295,66 @@ static esp_err_t provision_post_handler(httpd_req_t* req){
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
+static esp_err_t ip_get_handler(httpd_req_t* req) {
+    idle_timer_arm_5min();
+    char resp[64];
+    if (globalStatus & GLOBALSTAT_CONNECTED) {
+        esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        esp_netif_ip_info_t ip_info = {};
+        if (sta && esp_netif_get_ip_info(sta, &ip_info) == ESP_OK) {
+            snprintf(resp, sizeof(resp), "{\"connected\":true,\"ip\":\"" IPSTR "\"}",
+                     IP2STR(&ip_info.ip));
+        } else {
+            snprintf(resp, sizeof(resp), "{\"connected\":true,\"ip\":\"unknown\"}");
+        }
+    } else {
+        snprintf(resp, sizeof(resp), "{\"connected\":false}");
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, resp);
+}
+
+// PaperTracker streaming status and config.
+//   GET /pt              -> current state as JSON
+//   GET /pt?enable=0|1   -> turn native streaming off/on (persisted)
+//   GET /pt?host=1.2.3.4 -> pin the target, empty value returns to discovery
+static esp_err_t pt_get_handler(httpd_req_t* req) {
+    idle_timer_arm_5min();
+
+    char query[96];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char value[24];
+        if (httpd_query_key_value(query, "enable", value, sizeof(value)) == ESP_OK) {
+            pt_set_enabled(value[0] != '0');
+        }
+        if (httpd_query_key_value(query, "host", value, sizeof(value)) == ESP_OK) {
+            if (!pt_set_target(value)) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid host");
+                return ESP_FAIL;
+            }
+        }
+    }
+
+    char target[16];
+    pt_target_str(target, sizeof(target));
+    char resp[224];
+    int len = snprintf(resp, sizeof(resp),
+        "{\"enabled\":%s,\"streaming\":%s,\"target\":\"%s\",\"pinned\":%s,"
+        "\"port\":%d,\"frames\":%lu,\"packets\":%lu,\"errors\":%lu}",
+        pt_enabled ? "true" : "false",
+        pt_streaming ? "true" : "false",
+        target,
+        pt_target_pinned ? "true" : "false",
+        PT_PORT,
+        (unsigned long)pt_frames_sent,
+        (unsigned long)pt_packets_sent,
+        (unsigned long)pt_send_errors);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, resp, len);
+}
+
 static esp_err_t spistream_handler(httpd_req_t* req, uint8_t spi_num) {
     ESP_LOGI(TAG, "Stream handler called : %d", spi_num);
     uint8_t once_stream = 0; // check for replacement image stream
@@ -397,9 +488,11 @@ static void stream_task(void* arg) {
     flags &= ~(1<<idx);
     if(!flags) {
         // gpio_set_level(PIN_POW, 0);
-        // Stream ended and no other streams active: arm 5-minute idle sleep
-        idle_timer_arm_5min();
+        // Stream ended and no other streams active: arm 5-minute idle sleep.
+        // Clear the streaming bit first, or arming is a no-op. If the
+        // PaperTracker path picks the cameras back up it re-cancels the timer.
         globalStatus &= ~GLOBALSTAT_STREAMING; // not streaming
+        idle_timer_arm_5min();
     }
     // Mark task handle cleared
     stream_task_handle[idx] = nullptr;
@@ -427,7 +520,18 @@ static esp_err_t stream_handler_common(httpd_req_t* req) {
     // Cancel idle sleep while streaming
     idle_timer_cancel();
 
-    if (httpd_resp_set_type(req, _STREAM_CONTENT_TYPE) != ESP_OK) return ESP_FAIL;
+    // Claim the SPI buffers from the PaperTracker stream task: it refuses to
+    // start a new cycle once any flags bit is set, so take the bit first and
+    // then wait out whatever cycle is already in flight.
+    flags |= (1 << idx);
+    if (!pt_wait_idle(500)) {
+        ESP_LOGW(TAG, "PaperTracker cycle did not yield in time for stream %u", idx);
+    }
+
+    if (httpd_resp_set_type(req, _STREAM_CONTENT_TYPE) != ESP_OK) {
+        flags &= ~(1 << idx);
+        return ESP_FAIL;
+    }
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, OPTIONS");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
@@ -437,22 +541,28 @@ static esp_err_t stream_handler_common(httpd_req_t* req) {
     httpd_req_async_handler_begin(req, &copy);
     if (!copy) {
         ESP_LOGE(TAG, "Failed to create copy of request");
+        flags &= ~(1 << idx);
         return ESP_FAIL;
     }
-    
+
     StreamTaskArg* a = (StreamTaskArg*)malloc(sizeof(StreamTaskArg));
-    if (!a) { httpd_req_async_handler_complete(copy); return ESP_FAIL; }
+    if (!a) { httpd_req_async_handler_complete(copy); flags &= ~(1 << idx); return ESP_FAIL; }
     a->req = copy; a->index = idx;
     if (xTaskCreate(stream_task, "stream_task", 3*1024, a, 5, &stream_task_handle[idx]) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create stream task");
         httpd_req_async_handler_complete(copy);
         if(a) free(a);
+        flags &= ~(1 << idx);
         return ESP_FAIL;
     }
     return ESP_OK;
 }
 
 extern "C" void app_main(void) {
+    //check ADC voltage and if low, enter deep sleep
+    if(read_battery_voltage_mv() < 3300){
+        enter_deep_sleep_wait_button();
+    }
     // Mark current app as valid (for rollback support)
     const esp_partition_t* running = esp_ota_get_running_partition();
     esp_ota_img_states_t ota_state;
@@ -478,7 +588,8 @@ extern "C" void app_main(void) {
     gpio_config(&gpioconfig);
 
     gpio_set_level(PIN_POW, 0); // Power off the camera
-    gpio_set_level(PIN_LEDP, 0); // Turn on power LED
+    gpio_set_level(PIN_LEDP, 1); // Turn off power LED
+    gpio_set_level(PIN_LEDW, 1); // Turn off working LED (active-low)
 
     // Log reset reason and, if woke from deep sleep via button, require 3s hold to proceed
     esp_reset_reason_t rr = esp_reset_reason();
@@ -626,11 +737,13 @@ extern "C" void app_main(void) {
     config.recv_wait_timeout = 10;
 
     httpd_handle_t stream_httpd = NULL;
-    constexpr uint8_t uri_handlers = 6 ;
-    if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+    constexpr uint8_t uri_handlers = 8 ;
+        if (httpd_start(&stream_httpd, &config) == ESP_OK) {
         httpd_uri_t stream_uri[uri_handlers] = {
             {.uri = "/", .method = HTTP_GET, .handler = index_get_handler, .user_ctx = NULL},
             {.uri = "/provision", .method = HTTP_POST, .handler = provision_post_handler, .user_ctx = NULL},
+            {.uri = "/ip", .method = HTTP_GET, .handler = ip_get_handler, .user_ctx = NULL},
+            {.uri = "/pt", .method = HTTP_GET, .handler = pt_get_handler, .user_ctx = NULL},
             {.uri = "/left", .method = HTTP_GET, .handler = stream_handler_common, .user_ctx = (void*)0},
             {.uri = "/right", .method = HTTP_GET, .handler = stream_handler_common, .user_ctx = (void*)1},
             {.uri = "/face", .method = HTTP_GET, .handler = stream_handler_common, .user_ctx = (void*)2},
@@ -641,6 +754,9 @@ extern "C" void app_main(void) {
     // Arm initial idle sleep timer once server is up
     idle_timer_arm_5min();
     }
+
+    // Native PaperTracker streaming: discovery listener + UDP sender
+    pt_udp_start(pt_fetch_frame);
 }
 static esp_err_t ota_post_handler(httpd_req_t* req) {
     idle_timer_cancel();
